@@ -148,6 +148,7 @@ pub(crate) struct TxParams {
     pub(crate) include_output_redeem_witness_script: bool,
     pub(crate) bumping_fee: Option<PreviousFee>,
     pub(crate) current_height: Option<u32>,
+    pub(crate) allow_dust: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -559,6 +560,12 @@ impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext>
     pub fn current_height(&mut self, height: u32) -> &mut Self {
         self.params.current_height = Some(height);
         self
+    }
+
+    /// Set whether or not the dust limit is checked.
+    pub fn allow_dust(&mut self, allow_dust: bool) -> &mut Self {
+      self.params.allow_dust = allow_dust;
+      self
     }
 }
 
