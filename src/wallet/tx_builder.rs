@@ -563,6 +563,8 @@ impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext>
     }
 
     /// Set whether or not the dust limit is checked.
+    ///
+    /// **Note**: by avoiding a dust limit check you may end up with a transaction that is non-standard.
     pub fn allow_dust(&mut self, allow_dust: bool) -> &mut Self {
         self.params.allow_dust = allow_dust;
         self
