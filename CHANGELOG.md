@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `descriptor::checksum::get_checksum_bytes` method.
 - Add `Excess` enum to handle remaining amount after coin selection.
 - Move change creation from `Wallet::create_tx` to `CoinSelectionAlgorithm::coin_select`.
+- Change the interface of `SqliteDatabase::new` to accept any type that implement AsRef<Path>
+- Add the ability to specify which leaves to sign in a taproot transaction through `TapLeavesOptions` in `SignOptions`
+- Add the ability to specify whether a taproot transaction should be signed using the internal key or not, using `sign_with_tap_internal_key` in `SignOptions`
+- Consolidate params `fee_amount` and `amount_needed` in `target_amount` in `CoinSelectionAlgorithm::coin_select` signature.
+- Change the meaning of the `fee_amount` field inside `CoinSelectionResult`: from now on the `fee_amount` will represent only the fees asociated with the utxos in the `selected` field of `CoinSelectionResult`.
+- New `RpcBlockchain` implementation with various fixes.
+- Return balance in separate categories, namely `confirmed`, `trusted_pending`, `untrusted_pending` & `immature`.
 
 ## [v0.20.0] - [v0.19.0]
 

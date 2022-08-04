@@ -438,10 +438,21 @@ where
         self.database.borrow().get_tx(txid, include_raw)
     }
 
-    /// Return the list of transactions made and received by the wallet
+    /// Return an unsorted list of transactions made and received by the wallet
     ///
     /// Optionally fill the [`TransactionDetails::transaction`] field with the raw transaction if
     /// `include_raw` is `true`.
+    ///
+    /// To sort transactions, the following code can be used:
+    /// ```no_run
+    /// # let mut tx_list: Vec<bdk::TransactionDetails> = vec![];
+    /// tx_list.sort_by(|a, b| {
+    ///     b.confirmation_time
+    ///         .as_ref()
+    ///         .map(|t| t.height)
+    ///         .cmp(&a.confirmation_time.as_ref().map(|t| t.height))
+    /// });
+    /// ```
     ///
     /// Note that this methods only operate on the internal database, which first needs to be
     /// [`Wallet::sync`] manually.
@@ -449,15 +460,52 @@ where
         self.database.borrow().iter_txs(include_raw)
     }
 
-    /// Return the balance, meaning the sum of this wallet's unspent outputs' values
+    /// Return the balance, separated into available, trusted-pending, untrusted-pending and immature
+    /// values.
     ///
     /// Note that this methods only operate on the internal database, which first needs to be
     /// [`Wallet::sync`] manually.
-    pub fn get_balance(&self) -> Result<u64, Error> {
-        Ok(self
-            .list_unspent()?
-            .iter()
-            .fold(0, |sum, i| sum + i.txout.value))
+    pub fn get_balance(&self) -> Result<Balance, Error> {
+        let mut immature = 0;
+        let mut trusted_pending = 0;
+        let mut untrusted_pending = 0;
+        let mut confirmed = 0;
+        let utxos = self.list_unspent()?;
+        let database = self.database.borrow();
+        let last_sync_height = match database
+            .get_sync_time()?
+            .map(|sync_time| sync_time.block_time.height)
+        {
+            Some(height) => height,
+            // None means database was never synced
+            None => return Ok(Balance::default()),
+        };
+        for u in utxos {
+            // Unwrap used since utxo set is created from database
+            let tx = database
+                .get_tx(&u.outpoint.txid, true)?
+                .expect("Transaction not found in database");
+            if let Some(tx_conf_time) = &tx.confirmation_time {
+                if tx.transaction.expect("No transaction").is_coin_base()
+                    && (last_sync_height - tx_conf_time.height) < COINBASE_MATURITY
+                {
+                    immature += u.txout.value;
+                } else {
+                    confirmed += u.txout.value;
+                }
+            } else if u.keychain == KeychainKind::Internal {
+                trusted_pending += u.txout.value;
+            } else {
+                untrusted_pending += u.txout.value;
+            }
+        }
+
+        Ok(Balance {
+            immature,
+            trusted_pending,
+            untrusted_pending,
+            confirmed,
+        })
     }
 
     /// Add an external signer
@@ -736,8 +784,6 @@ where
         let mut outgoing: u64 = 0;
         let mut received: u64 = 0;
 
-        fee_amount += fee_rate.fee_wu(tx.weight());
-
         let recipients = params.recipients.iter().map(|(r, v)| (r, *v));
 
         for (index, (script_pubkey, value)) in recipients.enumerate() {
@@ -756,12 +802,24 @@ where
                 script_pubkey: script_pubkey.clone(),
                 value,
             };
-            fee_amount += fee_rate.fee_vb(serialize(&new_out).len());
 
             tx.output.push(new_out);
 
             outgoing += value;
         }
+
+        fee_amount += fee_rate.fee_wu(tx.weight());
+
+        // Segwit transactions' header is 2WU larger than legacy txs' header,
+        // as they contain a witness marker (1WU) and a witness flag (1WU) (see BIP144).
+        // At this point we really don't know if the resulting transaction will be segwit
+        // or legacy, so we just add this 2WU to the fee_amount - overshooting the fee amount
+        // is better than undershooting it.
+        // If we pass a fee_amount that is slightly higher than the final fee_amount, we
+        // end up with a transaction with a slightly higher fee rate than the requested one.
+        // If, instead, we undershoot, we may end up with a feerate lower than the requested one
+        // - we might come up with non broadcastable txs!
+        fee_amount += fee_rate.fee_wu(2);
 
         if params.change_policy != tx_builder::ChangeSpendPolicy::ChangeAllowed
             && self.change_descriptor.is_none()
@@ -795,11 +853,10 @@ where
             required_utxos,
             optional_utxos,
             fee_rate,
-            outgoing,
-            fee_amount,
+            outgoing + fee_amount,
             &drain_script,
         )?;
-        let mut fee_amount = coin_selection.fee_amount;
+        fee_amount += coin_selection.fee_amount;
         let excess = &coin_selection.excess;
 
         tx.input = coin_selection
@@ -854,6 +911,9 @@ where
                     script_pubkey: drain_script,
                 };
 
+                // TODO: We should pay attention when adding a new output: this might increase
+                // the lenght of the "number of vouts" parameter by 2 bytes, potentially making
+                // our feerate too low
                 tx.output.push(drain_output);
             }
         };
@@ -1089,7 +1149,7 @@ where
             .iter()
             .chain(self.change_signers.signers().iter())
         {
-            signer.sign_transaction(psbt, &self.secp)?;
+            signer.sign_transaction(psbt, &sign_options, &self.secp)?;
         }
 
         // attempt to finalize
@@ -1861,6 +1921,14 @@ pub(crate) mod test {
     use crate::signer::{SignOptions, SignerError};
     use crate::wallet::AddressIndex::{LastUnused, New, Peek, Reset};
 
+    // The satisfaction size of a P2WPKH is 112 WU =
+    // 1 (elements in witness) + 1 (OP_PUSH) + 33 (pk) + 1 (OP_PUSH) + 72 (signature + sighash) + 1*4 (script len)
+    // On the witness itself, we have to push once for the pk (33WU) and once for signature + sighash (72WU), for
+    // a total of 105 WU.
+    // Here, we push just once for simplicity, so we have to add an extra byte for the missing
+    // OP_PUSH.
+    const P2WPKH_FAKE_WITNESS_SIZE: usize = 106;
+
     #[test]
     fn test_cache_addresses_fixed() {
         let db = MemoryDatabase::new();
@@ -1978,6 +2046,10 @@ pub(crate) mod test {
         "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{pk(cPZzKuNmpuUjD1e8jUU4PVzy2b5LngbSip8mBsxf4e7rSFZVb4Uh),pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642)})"
     }
 
+    pub(crate) fn get_test_tr_with_taptree_both_priv() -> &'static str {
+        "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{pk(cPZzKuNmpuUjD1e8jUU4PVzy2b5LngbSip8mBsxf4e7rSFZVb4Uh),pk(cNaQCDwmmh4dS9LzCgVtyy1e1xjCJ21GUDHe9K98nzb689JvinGV)})"
+    }
+
     pub(crate) fn get_test_tr_repeated_key() -> &'static str {
         "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100)),and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(200))})"
     }
@@ -1987,16 +2059,18 @@ pub(crate) mod test {
     }
 
     pub(crate) fn get_test_tr_with_taptree_xprv() -> &'static str {
-        "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{pk(tprv8ZgxMBicQKsPdDArR4xSAECuVxeX1jwwSXR4ApKbkYgZiziDc4LdBy2WvJeGDfUSE4UT4hHhbgEwbdq8ajjUHiKDegkwrNU6V55CxcxonVN/*),pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642)})"
+        "tr(cNJmN3fH9DDbDt131fQNkVakkpzawJBSeybCUNmP1BovpmGQ45xG,{pk(tprv8ZgxMBicQKsPdDArR4xSAECuVxeX1jwwSXR4ApKbkYgZiziDc4LdBy2WvJeGDfUSE4UT4hHhbgEwbdq8ajjUHiKDegkwrNU6V55CxcxonVN/*),pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642)})"
     }
 
     macro_rules! assert_fee_rate {
-        ($tx:expr, $fees:expr, $fee_rate:expr $( ,@dust_change $( $dust_change:expr )* )* $( ,@add_signature $( $add_signature:expr )* )* ) => ({
-            let mut tx = $tx.clone();
+        ($psbt:expr, $fees:expr, $fee_rate:expr $( ,@dust_change $( $dust_change:expr )* )* $( ,@add_signature $( $add_signature:expr )* )* ) => ({
+            let psbt = $psbt.clone();
+            #[allow(unused_mut)]
+            let mut tx = $psbt.clone().extract_tx();
             $(
                 $( $add_signature )*
                 for txin in &mut tx.input {
-                    txin.witness.push([0x00; 108]); // fake signature
+                    txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
                 }
             )*
 
@@ -2008,11 +2082,23 @@ pub(crate) mod test {
                 dust_change = true;
             )*
 
+            let fee_amount = psbt
+                .inputs
+                .iter()
+                .fold(0, |acc, i| acc + i.witness_utxo.as_ref().unwrap().value)
+                - psbt
+                    .unsigned_tx
+                    .output
+                    .iter()
+                    .fold(0, |acc, o| acc + o.value);
+
+            assert_eq!(fee_amount, $fees);
+
             let tx_fee_rate = FeeRate::from_wu($fees, tx.weight());
             let fee_rate = $fee_rate;
 
             if !dust_change {
-                assert!((tx_fee_rate - fee_rate).as_sat_vb().abs() < 0.5, "Expected fee rate of {:?}, the tx has {:?}", fee_rate, tx_fee_rate);
+                assert!(tx_fee_rate >= fee_rate && (tx_fee_rate - fee_rate).as_sat_vb().abs() < 0.5, "Expected fee rate of {:?}, the tx has {:?}", fee_rate, tx_fee_rate);
             } else {
                 assert!(tx_fee_rate >= fee_rate, "Expected fee rate of at least {:?}, the tx has {:?}", fee_rate, tx_fee_rate);
             }
@@ -2387,7 +2473,7 @@ pub(crate) mod test {
         builder.add_recipient(addr.script_pubkey(), 25_000);
         let (psbt, details) = builder.finish().unwrap();
 
-        assert_fee_rate!(psbt.extract_tx(), details.fee.unwrap_or(0), FeeRate::default(), @add_signature);
+        assert_fee_rate!(psbt, details.fee.unwrap_or(0), FeeRate::default(), @add_signature);
     }
 
     #[test]
@@ -2400,7 +2486,7 @@ pub(crate) mod test {
             .fee_rate(FeeRate::from_sat_per_vb(5.0));
         let (psbt, details) = builder.finish().unwrap();
 
-        assert_fee_rate!(psbt.extract_tx(), details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(5.0), @add_signature);
+        assert_fee_rate!(psbt, details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(5.0), @add_signature);
     }
 
     #[test]
@@ -3213,7 +3299,7 @@ pub(crate) mod test {
         let txid = tx.txid();
         // skip saving the new utxos, we know they can't be used anyways
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3257,7 +3343,7 @@ pub(crate) mod test {
             details.received
         );
 
-        assert_fee_rate!(psbt.extract_tx(), details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(2.5), @add_signature);
+        assert_fee_rate!(psbt, details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(2.5), @add_signature);
     }
 
     #[test]
@@ -3273,7 +3359,7 @@ pub(crate) mod test {
         let txid = tx.txid();
         // skip saving the new utxos, we know they can't be used anyways
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3339,7 +3425,7 @@ pub(crate) mod test {
         let mut tx = psbt.extract_tx();
         let txid = tx.txid();
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3367,7 +3453,7 @@ pub(crate) mod test {
         assert_eq!(tx.output.len(), 1);
         assert_eq!(tx.output[0].value + details.fee.unwrap_or(0), details.sent);
 
-        assert_fee_rate!(psbt.extract_tx(), details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(2.5), @add_signature);
+        assert_fee_rate!(psbt, details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(2.5), @add_signature);
     }
 
     #[test]
@@ -3383,7 +3469,7 @@ pub(crate) mod test {
         let mut tx = psbt.extract_tx();
         let txid = tx.txid();
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3439,7 +3525,7 @@ pub(crate) mod test {
         let mut tx = psbt.extract_tx();
         let txid = tx.txid();
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3496,7 +3582,7 @@ pub(crate) mod test {
         let mut tx = psbt.extract_tx();
         let txid = tx.txid();
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3537,7 +3623,7 @@ pub(crate) mod test {
         let txid = tx.txid();
         // skip saving the new utxos, we know they can't be used anyways
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3578,7 +3664,7 @@ pub(crate) mod test {
             details.received
         );
 
-        assert_fee_rate!(psbt.extract_tx(), details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(50.0), @add_signature);
+        assert_fee_rate!(psbt, details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(50.0), @add_signature);
     }
 
     #[test]
@@ -3600,7 +3686,7 @@ pub(crate) mod test {
         let txid = tx.txid();
         // skip saving the new utxos, we know they can't be used anyways
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3671,7 +3757,7 @@ pub(crate) mod test {
         let txid = tx.txid();
         // skip saving the new utxos, we know they can't be used anyways
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3718,7 +3804,7 @@ pub(crate) mod test {
             75_000 - original_send_all_amount - details.fee.unwrap_or(0)
         );
 
-        assert_fee_rate!(psbt.extract_tx(), details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(50.0), @add_signature);
+        assert_fee_rate!(psbt, details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(50.0), @add_signature);
     }
 
     #[test]
@@ -3742,13 +3828,14 @@ pub(crate) mod test {
         let txid = tx.txid();
         // skip saving the new utxos, we know they can't be used anyways
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
                 .del_utxo(&txin.previous_output)
                 .unwrap();
         }
+        let original_tx_weight = tx.weight();
         original_details.transaction = Some(tx);
         wallet
             .database
@@ -3757,7 +3844,20 @@ pub(crate) mod test {
             .unwrap();
 
         let mut builder = wallet.build_fee_bump(txid).unwrap();
-        builder.fee_rate(FeeRate::from_sat_per_vb(141.0));
+        // We set a fee high enough that during rbf we are forced to add
+        // a new input and also that we have to remove the change
+        // that we had previously
+
+        // We calculate the new weight as:
+        //   original weight
+        // + extra input weight: 160 WU = (32 (prevout) + 4 (vout) + 4 (nsequence)) * 4
+        // + input satisfaction weight: 112 WU = 106 (witness) + 2 (witness len) + (1 (script len)) * 4
+        // - change output weight: 124 WU = (8 (value) + 1 (script len) + 22 (script)) * 4
+        let new_tx_weight = original_tx_weight + 160 + 112 - 124;
+        // two inputs (50k, 25k) and one output (45k) - epsilon
+        // We use epsilon here to avoid asking for a slightly too high feerate
+        let fee_abs = 50_000 + 25_000 - 45_000 - 10;
+        builder.fee_rate(FeeRate::from_wu(fee_abs, new_tx_weight));
         let (psbt, details) = builder.finish().unwrap();
 
         assert_eq!(
@@ -3781,7 +3881,7 @@ pub(crate) mod test {
             45_000
         );
 
-        assert_fee_rate!(psbt.extract_tx(), details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(140.0), @dust_change, @add_signature);
+        assert_fee_rate!(psbt, details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(140.0), @dust_change, @add_signature);
     }
 
     #[test]
@@ -3803,7 +3903,7 @@ pub(crate) mod test {
         let txid = tx.txid();
         // skip saving the new utxos, we know they can't be used anyways
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3852,7 +3952,7 @@ pub(crate) mod test {
             details.received
         );
 
-        assert_fee_rate!(psbt.extract_tx(), details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(5.0), @add_signature);
+        assert_fee_rate!(psbt, details.fee.unwrap_or(0), FeeRate::from_sat_per_vb(5.0), @add_signature);
     }
 
     #[test]
@@ -3874,7 +3974,7 @@ pub(crate) mod test {
         let txid = tx.txid();
         // skip saving the new utxos, we know they can't be used anyways
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3953,7 +4053,7 @@ pub(crate) mod test {
         let mut tx = psbt.extract_tx();
         let txid = tx.txid();
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -3997,7 +4097,7 @@ pub(crate) mod test {
         let mut tx = psbt.extract_tx();
         let txid = tx.txid();
         for txin in &mut tx.input {
-            txin.witness.push([0x00; 108]); // fake signature
+            txin.witness.push([0x00; P2WPKH_FAKE_WITNESS_SIZE]); // fake signature
             wallet
                 .database
                 .borrow_mut()
@@ -4017,6 +4117,38 @@ pub(crate) mod test {
             .allow_shrinking(addr.script_pubkey())
             .unwrap();
         builder.finish().unwrap();
+    }
+
+    #[test]
+    fn test_fee_amount_negative_drain_val() {
+        // While building the transaction, bdk would calculate the drain_value
+        // as
+        // current_delta - fee_amount - drain_fee
+        // using saturating_sub, meaning that if the result would end up negative,
+        // it'll remain to zero instead.
+        // This caused a bug in master where we would calculate the wrong fee
+        // for a transaction.
+        // See https://github.com/bitcoindevkit/bdk/issues/660
+        let (wallet, descriptors, _) = get_funded_wallet(get_test_wpkh());
+        let send_to = Address::from_str("tb1ql7w62elx9ucw4pj5lgw4l028hmuw80sndtntxt").unwrap();
+        let fee_rate = FeeRate::from_sat_per_vb(2.01);
+        let incoming_txid = crate::populate_test_db!(
+            wallet.database.borrow_mut(),
+            testutils! (@tx ( (@external descriptors, 0) => 8859 ) (@confirmations 1)),
+            Some(100),
+        );
+
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(send_to.script_pubkey(), 8630)
+            .add_utxo(OutPoint::new(incoming_txid, 0))
+            .unwrap()
+            .enable_rbf()
+            .fee_rate(fee_rate);
+        let (psbt, details) = builder.finish().unwrap();
+
+        assert!(psbt.inputs.len() == 1);
+        assert_fee_rate!(psbt, details.fee.unwrap_or(0), fee_rate, @add_signature);
     }
 
     #[test]
@@ -4834,12 +4966,173 @@ pub(crate) mod test {
     }
 
     #[test]
+    fn test_taproot_no_key_spend() {
+        let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
+        let addr = wallet.get_address(AddressIndex::New).unwrap();
+
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), 25_000);
+        let (mut psbt, _) = builder.finish().unwrap();
+
+        assert!(
+            wallet
+                .sign(
+                    &mut psbt,
+                    SignOptions {
+                        sign_with_tap_internal_key: false,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            "Unable to finalize tx"
+        );
+
+        assert!(psbt.inputs.iter().all(|i| i.tap_key_sig.is_none()));
+    }
+
+    #[test]
     fn test_taproot_script_spend() {
         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree());
         test_spend_from_wallet(wallet);
 
         let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_xprv());
         test_spend_from_wallet(wallet);
+    }
+
+    #[test]
+    fn test_taproot_script_spend_sign_all_leaves() {
+        use crate::signer::TapLeavesOptions;
+        let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
+        let addr = wallet.get_address(AddressIndex::New).unwrap();
+
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), 25_000);
+        let (mut psbt, _) = builder.finish().unwrap();
+
+        assert!(
+            wallet
+                .sign(
+                    &mut psbt,
+                    SignOptions {
+                        tap_leaves_options: TapLeavesOptions::All,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            "Unable to finalize tx"
+        );
+
+        assert!(psbt
+            .inputs
+            .iter()
+            .all(|i| i.tap_script_sigs.len() == i.tap_scripts.len()));
+    }
+
+    #[test]
+    fn test_taproot_script_spend_sign_include_some_leaves() {
+        use crate::signer::TapLeavesOptions;
+        use crate::wallet::taproot::TapLeafHash;
+
+        let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
+        let addr = wallet.get_address(AddressIndex::New).unwrap();
+
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), 25_000);
+        let (mut psbt, _) = builder.finish().unwrap();
+        let mut script_leaves: Vec<_> = psbt.inputs[0]
+            .tap_scripts
+            .clone()
+            .values()
+            .map(|(script, version)| TapLeafHash::from_script(script, *version))
+            .collect();
+        let included_script_leaves = vec![script_leaves.pop().unwrap()];
+        let excluded_script_leaves = script_leaves;
+
+        assert!(
+            wallet
+                .sign(
+                    &mut psbt,
+                    SignOptions {
+                        tap_leaves_options: TapLeavesOptions::Include(
+                            included_script_leaves.clone()
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            "Unable to finalize tx"
+        );
+
+        assert!(psbt.inputs[0]
+            .tap_script_sigs
+            .iter()
+            .all(|s| included_script_leaves.contains(&s.0 .1)
+                && !excluded_script_leaves.contains(&s.0 .1)));
+    }
+
+    #[test]
+    fn test_taproot_script_spend_sign_exclude_some_leaves() {
+        use crate::signer::TapLeavesOptions;
+        use crate::wallet::taproot::TapLeafHash;
+
+        let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
+        let addr = wallet.get_address(AddressIndex::New).unwrap();
+
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), 25_000);
+        let (mut psbt, _) = builder.finish().unwrap();
+        let mut script_leaves: Vec<_> = psbt.inputs[0]
+            .tap_scripts
+            .clone()
+            .values()
+            .map(|(script, version)| TapLeafHash::from_script(script, *version))
+            .collect();
+        let included_script_leaves = vec![script_leaves.pop().unwrap()];
+        let excluded_script_leaves = script_leaves;
+
+        assert!(
+            wallet
+                .sign(
+                    &mut psbt,
+                    SignOptions {
+                        tap_leaves_options: TapLeavesOptions::Exclude(
+                            excluded_script_leaves.clone()
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            "Unable to finalize tx"
+        );
+
+        assert!(psbt.inputs[0]
+            .tap_script_sigs
+            .iter()
+            .all(|s| included_script_leaves.contains(&s.0 .1)
+                && !excluded_script_leaves.contains(&s.0 .1)));
+    }
+
+    #[test]
+    fn test_taproot_script_spend_sign_no_leaves() {
+        use crate::signer::TapLeavesOptions;
+        let (wallet, _, _) = get_funded_wallet(get_test_tr_with_taptree_both_priv());
+        let addr = wallet.get_address(AddressIndex::New).unwrap();
+
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), 25_000);
+        let (mut psbt, _) = builder.finish().unwrap();
+
+        wallet
+            .sign(
+                &mut psbt,
+                SignOptions {
+                    tap_leaves_options: TapLeavesOptions::None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(psbt.inputs.iter().all(|i| i.tap_script_sigs.is_empty()));
     }
 
     #[test]
@@ -4979,23 +5272,38 @@ pub(crate) mod test {
             Some(confirmation_time),
             (@coinbase true)
         );
+        let sync_time = SyncTime {
+            block_time: BlockTime {
+                height: confirmation_time,
+                timestamp: 0,
+            },
+        };
+        wallet
+            .database
+            .borrow_mut()
+            .set_sync_time(sync_time)
+            .unwrap();
 
         let not_yet_mature_time = confirmation_time + COINBASE_MATURITY - 1;
         let maturity_time = confirmation_time + COINBASE_MATURITY;
 
-        // The balance is nonzero, even if we can't spend anything
-        // FIXME: we should differentiate the balance between immature,
-        // trusted, untrusted_pending
-        // See https://github.com/bitcoindevkit/bdk/issues/238
         let balance = wallet.get_balance().unwrap();
-        assert!(balance != 0);
+        assert_eq!(
+            balance,
+            Balance {
+                immature: 25_000,
+                trusted_pending: 0,
+                untrusted_pending: 0,
+                confirmed: 0
+            }
+        );
 
         // We try to create a transaction, only to notice that all
         // our funds are unspendable
         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
         let mut builder = wallet.build_tx();
         builder
-            .add_recipient(addr.script_pubkey(), balance / 2)
+            .add_recipient(addr.script_pubkey(), balance.immature / 2)
             .current_height(confirmation_time);
         assert!(matches!(
             builder.finish().unwrap_err(),
@@ -5008,7 +5316,7 @@ pub(crate) mod test {
         // Still unspendable...
         let mut builder = wallet.build_tx();
         builder
-            .add_recipient(addr.script_pubkey(), balance / 2)
+            .add_recipient(addr.script_pubkey(), balance.immature / 2)
             .current_height(not_yet_mature_time);
         assert!(matches!(
             builder.finish().unwrap_err(),
@@ -5019,9 +5327,31 @@ pub(crate) mod test {
         ));
 
         // ...Now the coinbase is mature :)
+        let sync_time = SyncTime {
+            block_time: BlockTime {
+                height: maturity_time,
+                timestamp: 0,
+            },
+        };
+        wallet
+            .database
+            .borrow_mut()
+            .set_sync_time(sync_time)
+            .unwrap();
+
+        let balance = wallet.get_balance().unwrap();
+        assert_eq!(
+            balance,
+            Balance {
+                immature: 0,
+                trusted_pending: 0,
+                untrusted_pending: 0,
+                confirmed: 25_000
+            }
+        );
         let mut builder = wallet.build_tx();
         builder
-            .add_recipient(addr.script_pubkey(), balance / 2)
+            .add_recipient(addr.script_pubkey(), balance.confirmed / 2)
             .current_height(maturity_time);
         builder.finish().unwrap();
     }
@@ -5048,5 +5378,67 @@ pub(crate) mod test {
             .add_recipient(addr.script_pubkey(), 0);
 
         assert!(builder.finish().is_ok());
+    }
+
+    #[test]
+    fn test_fee_rate_sign_no_grinding_high_r() {
+        // Our goal is to obtain a transaction with a signature with high-R (71 bytes
+        // instead of 70). We then check that our fee rate and fee calculation is
+        // alright.
+        let (wallet, _, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
+        let addr = wallet.get_address(New).unwrap();
+        let fee_rate = FeeRate::from_sat_per_vb(1.0);
+        let mut builder = wallet.build_tx();
+        let mut data = vec![0];
+        builder
+            .drain_to(addr.script_pubkey())
+            .drain_wallet()
+            .fee_rate(fee_rate)
+            .add_data(&data);
+        let (mut psbt, details) = builder.finish().unwrap();
+        let (op_return_vout, _) = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .enumerate()
+            .find(|(_n, i)| i.script_pubkey.is_op_return())
+            .unwrap();
+
+        let mut sig_len: usize = 0;
+        // We try to sign many different times until we find a longer signature (71 bytes)
+        while sig_len < 71 {
+            // Changing the OP_RETURN data will make the signature change (but not the fee, until
+            // data[0] is small enough)
+            data[0] += 1;
+            psbt.unsigned_tx.output[op_return_vout].script_pubkey = Script::new_op_return(&data);
+            // Clearing the previous signature
+            psbt.inputs[0].partial_sigs.clear();
+            // Signing
+            wallet
+                .sign(
+                    &mut psbt,
+                    SignOptions {
+                        remove_partial_sigs: false,
+                        try_finalize: false,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            // We only have one key in the partial_sigs map, this is a trick to retrieve it
+            let key = psbt.inputs[0].partial_sigs.keys().next().unwrap();
+            sig_len = psbt.inputs[0].partial_sigs[key].sig.serialize_der().len();
+        }
+        // Actually finalizing the transaction...
+        wallet
+            .sign(
+                &mut psbt,
+                SignOptions {
+                    remove_partial_sigs: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // ...and checking that everything is fine
+        assert_fee_rate!(psbt, details.fee.unwrap_or(0), fee_rate);
     }
 }
