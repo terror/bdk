@@ -5025,4 +5025,28 @@ pub(crate) mod test {
             .current_height(maturity_time);
         builder.finish().unwrap();
     }
+
+    #[test]
+    fn test_allow_dust_limit() {
+        let (wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
+
+        let addr = wallet.get_address(New).unwrap();
+
+        let mut builder = wallet.build_tx();
+
+        builder.add_recipient(addr.script_pubkey(), 0);
+
+        assert!(matches!(
+            builder.finish().unwrap_err(),
+            Error::OutputBelowDustLimit(0)
+        ));
+
+        let mut builder = wallet.build_tx();
+
+        builder
+            .allow_dust(true)
+            .add_recipient(addr.script_pubkey(), 0);
+
+        assert!(builder.finish().is_ok());
+    }
 }
