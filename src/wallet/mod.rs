@@ -741,7 +741,10 @@ where
         let recipients = params.recipients.iter().map(|(r, v)| (r, *v));
 
         for (index, (script_pubkey, value)) in recipients.enumerate() {
-            if !params.allow_dust && value.is_dust(script_pubkey) && !script_pubkey.is_provably_unspendable() {
+            if !params.allow_dust
+                && value.is_dust(script_pubkey)
+                && !script_pubkey.is_provably_unspendable()
+            {
                 return Err(Error::OutputBelowDustLimit(index));
             }
 

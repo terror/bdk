@@ -564,8 +564,8 @@ impl<'a, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext>
 
     /// Set whether or not the dust limit is checked.
     pub fn allow_dust(&mut self, allow_dust: bool) -> &mut Self {
-      self.params.allow_dust = allow_dust;
-      self
+        self.params.allow_dust = allow_dust;
+        self
     }
 }
 
