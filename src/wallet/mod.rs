@@ -5358,7 +5358,7 @@ pub(crate) mod test {
 
     #[test]
     fn test_allow_dust_limit() {
-        let (wallet, _, _) = get_funded_wallet(get_test_single_sig_cltv());
+        let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
 
         let addr = wallet.get_address(New).unwrap();
 
